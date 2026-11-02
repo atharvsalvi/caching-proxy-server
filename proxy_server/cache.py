@@ -1,33 +1,57 @@
-import threading
-from typing import Optional, Dict, Any
+
+import json
+import redis
+
+from proxy_server.config import CACHE_TTL
+
+REDIS_HOST = "127.0.0.1"
+REDIS_PORT = 6379
+CACHE_PREFIX = "caching-proxy:"
+
 
 class CacheStore:
     def __init__(self):
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
+        self._redis = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            decode_responses=False,
+        )
 
-    def get(self, key: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            if key in self._cache:
-                print(f"Cache : HIT {key}")
-                return self._cache[key]
-            else:
-                print(f"Cache Not Present for key : {key}")
-                print(f"Cache : MISS {key}")
-                return None
+    def get(self, key):
+        cache_key = CACHE_PREFIX + key
+        cached_data = self._redis.get(cache_key)
 
-    def set(self, key: str, status_code: int, headers: list, body: bytes) -> None:
-        with self._lock:
-            self._cache[key] = {
-                "status_code": status_code,
-                "headers": headers,
-                "body": body
-            }
+        if cached_data is None:
+            return None
 
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
-            print("Cache cleared successfully.")
+        data = json.loads(cached_data)
 
-# Global cache instance
+        return {
+            "status_code": data["status_code"],
+            "headers": data["headers"],
+            "body": bytes.fromhex(data["body"]),
+        }
+
+    def set(self, key, status_code, headers, body):
+        cache_key = CACHE_PREFIX + key
+
+        data = {
+            "status_code": status_code,
+            "headers": list(headers),
+            "body": body.hex(),
+        }
+
+        self._redis.set(
+            cache_key,
+            json.dumps(data),
+            ex=CACHE_TTL,
+        )
+
+    def clear(self):
+        pattern = CACHE_PREFIX + "*"
+
+        for key in self._redis.scan_iter(match=pattern):
+            self._redis.delete(key)
+
+
 cache = CacheStore()

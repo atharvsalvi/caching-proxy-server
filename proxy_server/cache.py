@@ -1,6 +1,8 @@
 
 import json
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from proxy_server.config import CACHE_TTL
 
@@ -15,6 +17,9 @@ class CacheStore:
             host=REDIS_HOST,
             port=REDIS_PORT,
             decode_responses=False,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            retry=Retry(NoBackoff(), 0),
         )
 
     def get(self, key):

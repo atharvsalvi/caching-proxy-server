@@ -5,10 +5,12 @@ import threading
 import urllib.request
 import urllib.error
 from contextlib import contextmanager
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler
 
 from redis.exceptions import RedisError
 from proxy_server.cache import cache
+from proxy_server import policy
 import proxy_server.config
 
 
@@ -27,6 +29,8 @@ SUPPORTED_VARY_HEADERS = ("accept", "accept-language", "accept-encoding")
 # Track holders and waiters so a key keeps the same lock until its last user exits.
 _key_locks = {}
 _registry_lock = threading.Lock()
+_refreshing = set()
+MAX_BACKGROUND_REFRESHES = 4
 
 
 @contextmanager
@@ -82,9 +86,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def build_cache_key(method, target_url, forwarded_headers):
         """Identify the resource and the supported representation preferences."""
         variants = [[name, forwarded_headers.get(name)] for name in SUPPORTED_VARY_HEADERS]
-        # v4 also avoids old entries created with automatic redirect following
-        # and the earlier forwarding/framing rules.
-        return "v4:" + json.dumps([method, target_url, variants], separators=(",", ":"))
+        # Earlier entries lack the timing metadata needed to check freshness.
+        return "v5:" + json.dumps([method, target_url, variants], separators=(",", ":"))
 
     @staticmethod
     def build_forwarded_headers(headers):
@@ -108,24 +111,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         return forwarded
 
     @staticmethod
-    def has_directive(headers, directive):
-        """Check whether Cache-Control contains a directive."""
-        cache_control = headers.get("Cache-Control", "")
-
-        directives = {
-            item.strip().split("=", 1)[0].strip().lower()
-            for item in cache_control.split(",")
-        }
-
-        return directive.lower() in directives
-
-    @staticmethod
     def can_use_cache(headers):
         """Determine whether the request may use the shared cache."""
-        if ProxyRequestHandler.has_directive(headers, "no-store"):
-            return False
-
-        if ProxyRequestHandler.has_directive(headers, "no-cache"):
+        if {"no-store", "no-cache"}.intersection(policy.directives(headers.items())):
             return False
 
         if headers.get("Authorization") or headers.get("Cookie"):
@@ -145,17 +133,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         for key, value in headers:
             response_headers.setdefault(key.lower(), []).append(value)
 
-        cache_control = ", ".join(
-            response_headers.get("cache-control", [])
-        ).lower()
-
-        directives = {
-            item.strip().split("=", 1)[0].strip()
-            for item in cache_control.split(",")
-        }
-
-        # Conservative policy: do not store these responses.
-        if directives.intersection({"no-store", "no-cache", "private"}):
+        rules = policy.directives(headers)
+        if {"no-store", "private"}.intersection(rules):
+            return False
+        if "no-cache" in rules and not policy.validators(headers):
+            return False
+        # Use the fallback TTL only for statuses we heuristically cache.
+        if status_code not in (200, 203, 204, 300, 301, 308) and not (
+            {"max-age", "s-maxage"}.intersection(rules) or "expires" in response_headers
+        ):
             return False
 
         # Avoid caching responses that set client-specific cookies.
@@ -175,7 +161,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def send_origin_headers(self, status, headers, length, cache_status):
-        self.send_response(status)
+        self.send_response_only(status)
+        if policy.header(headers, "date") is None:
+            self.send_header("Date", self.date_time_string())
         excluded = excluded_headers(headers) | {"x-cache"}
         for name, value in headers:
             if name.lower() not in excluded:
@@ -242,28 +230,67 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except RedisError:
             self.forward_request(target_url, forwarded_headers, req_body, None)
             return
-        if cached_response is None:
+        request_rules = policy.directives(self.headers.items())
+        if not policy.fresh(cached_response, request_rules):
+            if policy.can_serve_stale(cached_response, request_rules):
+                if self.schedule_refresh(cache_key, target_url, forwarded_headers):
+                    self.send_cached(cached_response, "STALE")
+                    return
             with lock_for_key(cache_key):
                 # Another thread might have populated Redis since our first lookup.
                 try:
                     cached_response = cache.get(cache_key)
                 except RedisError:
                     cache_key = None
-                if cached_response is None and cache_key is not None:
-                    self.forward_request(target_url, forwarded_headers, req_body, cache_key)
+                if cache_key is not None and not policy.fresh(cached_response, request_rules):
+                    self.forward_request(target_url, forwarded_headers, req_body, cache_key, cached_response)
                     return
             if cache_key is None:
                 self.forward_request(target_url, forwarded_headers, req_body, None)
                 return
 
+        self.send_cached(cached_response, "HIT")
+
+    def send_cached(self, cached_response, cache_status):
+        headers = [(k, v) for k, v in cached_response["headers"] if k.lower() != "age"]
+        headers.append(("Age", str(int(policy.age(cached_response, policy.time())))))
         try:
             self.send_origin_headers(cached_response["status_code"],
-                                     cached_response["headers"], len(cached_response["body"]), "HIT")
+                                     headers, len(cached_response["body"]), cache_status)
             self.wfile.write(cached_response["body"])
         except OSError:
             pass  # The client disconnected or stopped reading.
 
-    def forward_request(self, target_url, forwarded_headers, req_body, cache_key):
+    def schedule_refresh(self, key, url, headers):
+        # Reserve a worker before starting it. Concurrent readers share this refresh.
+        with _registry_lock:
+            if key in _refreshing:
+                return True
+            if len(_refreshing) >= MAX_BACKGROUND_REFRESHES:
+                return False
+            _refreshing.add(key)
+
+        def refresh():
+            try:
+                with lock_for_key(key):
+                    current = cache.get(key)
+                    if current is not None and not policy.fresh(current, {}):
+                        self.forward_request(url, headers, None, key, current, background=True)
+            except RedisError:
+                pass  # No refreshed entry. The original freshness deadline still applies.
+            finally:
+                with _registry_lock:
+                    _refreshing.discard(key)
+
+        try:
+            threading.Thread(target=refresh, daemon=True).start()
+        except RuntimeError:
+            with _registry_lock:
+                _refreshing.discard(key)
+            return False
+        return True
+
+    def forward_request(self, target_url, forwarded_headers, req_body, cache_key, stale=None, background=False):
         req = urllib.request.Request(
             url=target_url,
             data=req_body,
@@ -272,16 +299,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         for key, value in forwarded_headers.items():
             req.add_header(key, value)
+        conditional = policy.validators(stale["headers"]) if stale else {}
+        for key, value in conditional.items():
+            req.add_header(key, value)
 
         # Connect directly to the configured origin; return redirects unchanged.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         response_started = False
         try:
+            requested_at = policy.time()
             try:
                 response = opener.open(req, timeout=proxy_server.config.ORIGIN_TIMEOUT)
             except urllib.error.HTTPError as error:
                 response = error  # HTTP errors and redirects still have responses to forward.
             with response:
+                received_at = policy.time()
                 status_code = response.status
                 headers = list(response.headers.items())
                 response_length = content_length(response.headers)
@@ -293,6 +325,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     response_length = 0
                 if not 200 <= status_code < 600:
                     raise ValueError("Unsupported origin status")
+                if status_code == 304 and conditional:
+                    updated = self.merge_validated(stale, headers, requested_at, received_at)
+                    if updated is None:
+                        # The 304 cannot safely describe this body. Fetch a complete response.
+                        self.discard(cache_key)
+                        response.close()
+                        self.forward_request(target_url, forwarded_headers, req_body, cache_key,
+                                             background=background)
+                    else:
+                        self.store(cache_key, updated)
+                        if not background:
+                            self.send_cached(updated, "REVALIDATED")
+                    return
                 store_response = (
                     cache_key is not None and self.can_store_response(status_code, headers)
                     and response_length is not None
@@ -302,14 +347,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     body = response.read(response_length)
                     if len(body) != response_length:
                         raise ValueError("Incomplete origin response")
-                    try:
-                        cache.set(cache_key, status_code, headers, body)
-                    except RedisError:
-                        pass  # The origin response is still valid for this client.
+                    timing = policy.freshness(headers, requested_at, received_at)
+                    self.store(cache_key, dict(status_code=status_code, headers=headers, body=body, **timing))
+                    if background:
+                        return
                     response_started = True
                     self.send_origin_headers(status_code, headers, len(body), "MISS")
                     self.wfile.write(body)
                 else:
+                    if stale and status_code < 500:
+                        self.discard(cache_key)
+                    if background:
+                        return
                     # Unknown-length and large bodies never accumulate in memory.
                     response_started = True
                     self.send_origin_headers(status_code, headers, response_length, "MISS")
@@ -323,11 +372,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except (OSError, http.client.HTTPException, ValueError) as error:
             # After streaming starts, another status line would corrupt the body.
             # Closing the connection is the only available failure signal.
-            if not response_started:
+            if not background and not response_started:
                 reason = getattr(error, "reason", error)
                 self.send_error(504 if isinstance(reason, TimeoutError) else 502,
                                 "Origin timed out" if isinstance(reason, TimeoutError)
                                 else "Invalid or unavailable origin response")
+
+    @staticmethod
+    def store(key, entry):
+        timing = {name: entry[name] for name in ("initial_age", "received_at", "lifetime")}
+        try:
+            cache.set(key, entry["status_code"], entry["headers"], entry["body"], timing)
+        except RedisError:
+            pass  # The verified response is still valid for the current client.
+
+    @staticmethod
+    def discard(key):
+        try:
+            cache.delete(key)
+        except RedisError:
+            pass
+
+    def merge_validated(self, stale, headers, requested_at, received_at):
+        old = stale["headers"]
+        tag = policy.header(headers, "etag")
+        old_tag = policy.header(old, "etag")
+        if tag and (not old_tag or tag.removeprefix("W/") != old_tag.removeprefix("W/")):
+            return None
+        modified = policy.header(headers, "last-modified")
+        if not old_tag and modified and modified != policy.header(old, "last-modified"):
+            return None
+        for name in ("content-encoding", "content-type", "content-range"):
+            value = policy.header(headers, name)
+            if value is not None and value != policy.header(old, name):
+                return None
+        length = policy.header(headers, "content-length")
+        if length is not None and int(length) != len(stale["body"]):
+            return None
+        excluded = excluded_headers(headers) | {"x-cache"}
+        updates = [(k, v) for k, v in headers if k.lower() not in excluded]
+        if policy.header(updates, "date") is None:
+            updates.append(("Date", formatdate(received_at, usegmt=True)))
+        replaced = {k.lower() for k, _ in updates} | {"age"}
+        merged = [(k, v) for k, v in old if k.lower() not in replaced] + updates
+        if not self.can_store_response(stale["status_code"], merged):
+            return None
+        return {**stale, "headers": merged, **policy.freshness(merged, requested_at, received_at)}
 
     def do_GET(self):
         self.handle_request()

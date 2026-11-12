@@ -2,13 +2,13 @@
 
 import http.client
 import json
-import threading
 import unittest
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
 from proxy_server import config, proxy
+from server_helpers import running_server
 
 
 class MemoryCache:
@@ -18,10 +18,14 @@ class MemoryCache:
     def get(self, key):
         return self.entries.get(key)
 
-    def set(self, key, status_code, headers, body):
+    def set(self, key, status_code, headers, body, timing=None):
         self.entries[key] = {
             "status_code": status_code, "headers": headers, "body": body,
+            **(timing or {}),
         }
+
+    def delete(self, key):
+        self.entries.pop(key, None)
 
 
 class OriginHandler(BaseHTTPRequestHandler):
@@ -85,21 +89,7 @@ class CacheKeyTests(unittest.TestCase):
 
 class ProxyRequestTests(unittest.TestCase):
     def start_server(self, handler, label=""):
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        server.label = label
-        server.requests = []
-        server.request_headers = []
-        server.response_headers = []
-        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
-        thread.start()
-
-        def stop_server():
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
-
-        self.addCleanup(stop_server)
-        return server
+        return self.enterContext(running_server(handler, label))
 
     def setUp(self):
         self.origin = self.start_server(OriginHandler, "origin-a")

@@ -1,10 +1,11 @@
 
 import json
+import math
 import redis
 from redis.backoff import NoBackoff
 from redis.retry import Retry
 
-from proxy_server.config import CACHE_TTL
+from proxy_server import config, policy
 
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
@@ -31,26 +32,31 @@ class CacheStore:
 
         data = json.loads(cached_data)
 
-        return {
-            "status_code": data["status_code"],
-            "headers": data["headers"],
-            "body": bytes.fromhex(data["body"]),
-        }
+        data["body"] = bytes.fromhex(data["body"])
+        return data
 
-    def set(self, key, status_code, headers, body):
+    def set(self, key, status_code, headers, body, timing):
         cache_key = CACHE_PREFIX + key
 
         data = {
+            **timing,
             "status_code": status_code,
             "headers": list(headers),
             "body": body.hex(),
         }
 
+        remaining = timing["lifetime"] - policy.age(timing, policy.time())
+        retention = config.VALIDATOR_RETENTION if policy.validators(headers) else 0
+        ttl = max(1, math.ceil(max(max(0, remaining) + retention,
+                                   remaining + policy.grace_seconds(headers))))
         self._redis.set(
             cache_key,
             json.dumps(data),
-            ex=CACHE_TTL,
+            ex=ttl,
         )
+
+    def delete(self, key):
+        self._redis.delete(CACHE_PREFIX + key)
 
     def clear(self):
         pattern = CACHE_PREFIX + "*"

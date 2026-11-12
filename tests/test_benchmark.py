@@ -18,14 +18,16 @@ def test_latency_and_throughput_use_different_denominators():
 
 
 @pytest.mark.redis
-def test_benchmark_entry_point_runs_all_four_scenarios(live_store, tmp_path):
+@pytest.mark.parametrize("backend", ["threaded", "fastapi"])
+def test_benchmark_entry_point_runs_all_scenarios(live_store, tmp_path, backend):
     output = tmp_path / "run.json"
     subprocess.run([
         sys.executable, "-B", "-m", "benchmarks.run", "--requests", "4", "--workers", "2",
         "--delay-ms", "5", "--redis-port", os.environ.get("PROXY_TEST_REDIS_PORT", "6379"),
-        "--output", str(output),
+        "--backend", backend, "--refresh-comparison", "--output", str(output),
     ], cwd=Path(__file__).resolve().parents[1], check=True, timeout=30)
     scenarios = json.loads(output.read_text(encoding="utf-8"))["scenarios"]
-    for name, calls in {"direct": 4, "cold_miss": 4, "warm_hit": 0, "concurrent": 2}.items():
+    for name, calls in {"direct": 4, "cold_miss": 4, "warm_hit": 0, "concurrent": 2,
+                        "blocking": 2, "background": 2}.items():
         assert len(scenarios[name]["samples"]) == 4
         assert scenarios[name]["summary"]["origin_requests"] == calls

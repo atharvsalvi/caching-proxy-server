@@ -4,6 +4,11 @@ A Python reverse proxy that forwards HTTP requests to one configured origin and
 shares eligible GET responses through Redis. The response header `X-Cache` lets
 you follow a request through a cold fetch, a cache hit, or a refresh.
 
+On the `codex/fastapi` branch, Uvicorn runs the FastAPI proxy by default.
+While one request waits for Redis or the origin, the event loop can serve
+another request. Add `--backend threaded` to the same startup command to
+run the original implementation.
+
 ## Run a local demo
 
 Use Python 3.11 or later and Redis 7. The commands below use PowerShell. Run
@@ -58,15 +63,16 @@ stop the two servers. To clear all proxy entries under the shared
 
 ```mermaid
 flowchart LR
-    C[HTTP client] -->|Request| P[ThreadingHTTPServer and proxy handler]
+    C[HTTP client] -->|Request| P[Uvicorn and FastAPI]
     P <-->|Look up or store a representation| R[(Redis)]
     P <-->|Fetch or conditionally validate| O[Configured origin]
     P -->|HTTP response with X-Cache| C
 ```
 
 - [CLI](proxy_server/cli.py) starts a loopback listener and configures the origin.
-- [Request handler](proxy_server/proxy.py) forwards requests, matches variants,
-  coordinates concurrent misses, and streams bodies.
+- [FastAPI handler](proxy_server/asgi.py) uses asynchronous Redis and HTTP
+  connections. Both backends share cache keys, storage format and validation
+  rules with the [threaded handler](proxy_server/proxy.py).
 - [Cache policy](proxy_server/policy.py) calculates age, freshness, validation
   headers, and the allowed stale window.
 - [Redis storage](proxy_server/cache.py) serializes the status, headers, body and
@@ -77,7 +83,7 @@ flowchart LR
 | X-Cache | Meaning |
 | --- | --- |
 | MISS | The proxy fetched from the origin. Bypassed and streamed origin responses also use this value. |
-| HIT | Redis supplied a fresh response. A concurrent request may have waited for another thread to populate it. |
+| HIT | Redis supplied a fresh response. A concurrent request may have waited for another request to populate it. |
 | REVALIDATED | The origin returned 304 to the proxy's conditional request. The client receives the stored representation and updated headers. |
 | STALE | The origin permitted stale-while-revalidate. The client receives the saved body while one background refresh handles that key. |
 
@@ -108,16 +114,17 @@ If a Redis write fails, the client can still receive the origin response.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `--backend` | fastapi | Select fastapi or threaded |
 | `--port` | Required for serving | Listen on this port on 127.0.0.1 |
 | `--origin` | Required for serving | HTTP or HTTPS origin URL, optionally including a base path |
 | `--origin-timeout` | 10 seconds | Timeout for blocking origin socket operations |
-| `--client-timeout` | 10 seconds | Timeout for blocking client socket operations |
+| `--client-timeout` | 10 seconds | FastAPI timeout for upload reads and streamed response sends, or threaded client socket timeout |
 | `--max-request-body` | 1,048,576 bytes | Maximum buffered upload size |
 | `--max-cache-body` | 1,048,576 bytes | Maximum known-length response size eligible for storage |
 | `--clear-cache` | Off | Clear the shared proxy namespace and exit |
 
-Large, unknown-length and uncacheable responses stream in reads of up to
-64 KiB. Redirects pass through with their Location header. The proxy filters
+Large, unknown-length and uncacheable responses stream from the origin.
+Redirects pass through with their Location header. The proxy filters
 connection-specific headers, decodes chunked origin responses, and rejects
 unsupported chunked uploads. [HTTP handling details](docs/phase-2-http.md)
 
@@ -141,7 +148,8 @@ suite on pushes and pull requests with a Redis 7 service and Python 3.11 and
 ```
 
 The runner starts the client, proxy and origin locally and uses a dedicated
-Redis prefix. In one Windows run with a 1 KiB response, 20 ms of simulated
+Redis prefix. Pass `--backend threaded` to measure the original server under the
+same settings. In one earlier threaded Windows run with a 1 KiB response, 20 ms of simulated
 origin work and 200 requests per scenario, mean client latency was **32.11 ms
 direct**, **69.84 ms on a cold MISS**, and **3.52 ms on a warm HIT**. In the
 same run, four-client cold bursts resulted in 50 origin calls for 200 clients.

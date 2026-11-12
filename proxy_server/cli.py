@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--port", type=int, help="Port on which the proxy server will run")
     parser.add_argument("--origin", type=str, help="Origin URL to forward requests to")
     parser.add_argument("--clear-cache", action="store_true", help="Clear the stored cache")
+    parser.add_argument("--backend", choices=["fastapi", "threaded"], default="fastapi")
     parser.add_argument("--origin-timeout", type=positive_timeout, default=10.0,
                         help="Origin socket timeout in seconds (default: 10)")
     parser.add_argument("--client-timeout", type=positive_timeout, default=10.0,
@@ -57,6 +58,12 @@ def main():
     print(f"Forwarding requests to {args.origin}")
 
     server_address = ("127.0.0.1", args.port)
+    if args.backend == "fastapi":
+        import uvicorn
+        from proxy_server.asgi import create_app
+        uvicorn.run(create_app(args.origin), host=server_address[0], port=args.port,
+                    access_log=False, server_header=False, date_header=False, ws="none")
+        return
     httpd = ThreadingHTTPServer(server_address, proxy_server.proxy.ProxyRequestHandler)
 
     try:

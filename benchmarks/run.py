@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 import platform
+import socket
 import statistics
 import threading
 import time
@@ -62,6 +63,43 @@ def serve(handler):
         finally:
             server.shutdown()
             thread.join()
+
+
+@contextmanager
+def serve_proxy(backend, origin_url):
+    if backend == "threaded":
+        def refreshing():
+            with proxy._registry_lock:
+                return bool(proxy._refreshing)
+
+        config.ORIGIN_URL = origin_url
+        with serve(proxy.ProxyRequestHandler) as server:
+            yield server.server_port, refreshing
+        return
+
+    import uvicorn
+    from proxy_server.asgi import create_app
+
+    app = create_app(origin_url)
+    server = uvicorn.Server(uvicorn.Config(app, access_log=False, log_level="error", ws="none",
+                                          server_header=False, date_header=False))
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10
+            while not server.started:
+                if not thread.is_alive() or time.monotonic() > deadline:
+                    raise RuntimeError("FastAPI server failed to start")
+                time.sleep(0.01)
+            yield port, lambda: bool(app.state.refreshes)
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)
+            if thread.is_alive():
+                raise RuntimeError("FastAPI server failed to stop")
 
 
 def request(port, path, barrier=None):
@@ -136,6 +174,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Clients per concurrent burst")
     parser.add_argument("--delay-ms", type=int, default=20, help="Origin delay per request")
     parser.add_argument("--redis-port", type=int, default=6379)
+    parser.add_argument("--backend", choices=["fastapi", "threaded"], default="fastapi")
     parser.add_argument("--refresh-comparison", action="store_true",
                         help="Also compare bursts against immediately expired entries, with and without grace")
     parser.add_argument("--output", type=Path, help="Save settings, summaries, and raw samples as JSON")
@@ -157,23 +196,25 @@ def main():
         parser.exit(1, f"Redis unavailable at 127.0.0.1:{args.redis_port}: {error}\n")
     report = {
         "started_utc": datetime.now(timezone.utc).isoformat(), "os": platform.platform(),
+        "backend": args.backend,
         "python": platform.python_version(), "redis": version, "redis_py": redis.__version__,
         "body_bytes": len(BODY), "requests_per_scenario": args.requests,
         "workers": args.workers, "delay_ms": args.delay_ms, "scenarios": {},
     }
     try:
-        with serve(Origin) as origin, serve(proxy.ProxyRequestHandler) as server:
+        with serve(Origin) as origin, serve_proxy(
+            args.backend, f"http://127.0.0.1:{origin.server_port}"
+        ) as (port, refreshing):
             origin.calls = 0
             origin.counter_lock = threading.Lock()
             origin.delay = args.delay_ms / 1000
-            config.ORIGIN_URL = f"http://127.0.0.1:{origin.server_port}"
             for name in ("direct", "cold_miss", "warm_hit", "concurrent"):
-                result = measure(name, origin, server.server_port, args.requests, args.workers)
+                result = measure(name, origin, port, args.requests, args.workers)
                 report["scenarios"][name] = result
                 print(name, json.dumps(result["summary"]), flush=True)
             if args.refresh_comparison:
                 for mode in ("blocking", "background"):
-                    result = measure_refresh(mode, origin, server.server_port, args.requests, args.workers)
+                    result = measure_refresh(mode, origin, port, args.requests, args.workers, refreshing)
                     report["scenarios"][mode] = result
                     print(mode, json.dumps(result["summary"]), flush=True)
     finally:
@@ -185,7 +226,7 @@ def main():
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
-def measure_refresh(mode, origin, port, count, workers):
+def measure_refresh(mode, origin, port, count, workers, refreshing):
     samples = []
     elapsed = 0
     calls = 0
@@ -210,11 +251,7 @@ def measure_refresh(mode, origin, port, count, workers):
             # Exclude background completion and verification from client latency,
             # but account for every resulting origin request before the next burst.
             deadline = time.monotonic() + 15
-            while True:
-                with proxy._registry_lock:
-                    active = bool(proxy._refreshing)
-                if not active:
-                    break
+            while refreshing():
                 if time.monotonic() >= deadline:
                     raise RuntimeError("Background refresh did not finish")
                 time.sleep(0.002)

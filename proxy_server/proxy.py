@@ -393,7 +393,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except RedisError:
             pass
 
-    def merge_validated(self, stale, headers, requested_at, received_at):
+    @classmethod
+    def merge_validated(cls, stale, headers, requested_at, received_at):
         old = stale["headers"]
         tag = policy.header(headers, "etag")
         old_tag = policy.header(old, "etag")
@@ -415,7 +416,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             updates.append(("Date", formatdate(received_at, usegmt=True)))
         replaced = {k.lower() for k, _ in updates} | {"age"}
         merged = [(k, v) for k, v in old if k.lower() not in replaced] + updates
-        if not self.can_store_response(stale["status_code"], merged):
+        if not cls.can_store_response(stale["status_code"], merged):
             return None
         return {**stale, "headers": merged, **policy.freshness(merged, requested_at, received_at)}
 

@@ -12,6 +12,31 @@ REDIS_PORT = 6379
 CACHE_PREFIX = "caching-proxy:"
 
 
+def unpack_entry(cached_data):
+    if cached_data is None:
+        return None
+
+    data = json.loads(cached_data)
+
+    data["body"] = bytes.fromhex(data["body"])
+    return data
+
+
+def pack_entry(status_code, headers, body, timing):
+    data = {
+        **timing,
+        "status_code": status_code,
+        "headers": list(headers),
+        "body": body.hex(),
+    }
+
+    remaining = timing["lifetime"] - policy.age(timing, policy.time())
+    retention = config.VALIDATOR_RETENTION if policy.validators(headers) else 0
+    ttl = max(1, math.ceil(max(max(0, remaining) + retention,
+                               remaining + policy.grace_seconds(headers))))
+    return json.dumps(data), ttl
+
+
 class CacheStore:
     def __init__(self):
         self._redis = redis.Redis(
@@ -27,31 +52,15 @@ class CacheStore:
         cache_key = CACHE_PREFIX + key
         cached_data = self._redis.get(cache_key)
 
-        if cached_data is None:
-            return None
-
-        data = json.loads(cached_data)
-
-        data["body"] = bytes.fromhex(data["body"])
-        return data
+        return unpack_entry(cached_data)
 
     def set(self, key, status_code, headers, body, timing):
         cache_key = CACHE_PREFIX + key
 
-        data = {
-            **timing,
-            "status_code": status_code,
-            "headers": list(headers),
-            "body": body.hex(),
-        }
-
-        remaining = timing["lifetime"] - policy.age(timing, policy.time())
-        retention = config.VALIDATOR_RETENTION if policy.validators(headers) else 0
-        ttl = max(1, math.ceil(max(max(0, remaining) + retention,
-                                   remaining + policy.grace_seconds(headers))))
+        payload, ttl = pack_entry(status_code, headers, body, timing)
         self._redis.set(
             cache_key,
-            json.dumps(data),
+            payload,
             ex=ttl,
         )
 

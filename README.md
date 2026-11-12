@@ -4,7 +4,7 @@ A Python reverse proxy that forwards HTTP requests to one configured origin and
 shares eligible GET responses through Redis. The response header `X-Cache` lets
 you follow a request through a cold fetch, a cache hit, or a refresh.
 
-On the `codex/fastapi` branch, Uvicorn runs the FastAPI proxy by default.
+On the `fastapi` branch, Uvicorn runs the FastAPI proxy by default.
 While one request waits for Redis or the origin, the event loop can serve
 another request. Add `--backend threaded` to the same startup command to
 run the original implementation.
@@ -162,7 +162,7 @@ clients per concurrent burst. Mean client latency in milliseconds was:
 | Stale response during background refresh | 6.25 | 9.97 |
 
 Both backends made 25 origin calls for 100 concurrent cold requests. See the
-[threaded baseline](https://github.com/atharvsalvi/caching-proxy-server/tree/codex/threaded-baseline)
+[threaded baseline](https://github.com/atharvsalvi/caching-proxy-server/tree/threaded-baseline)
 for the original implementation.
 
 ```powershell

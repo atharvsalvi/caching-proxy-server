@@ -143,6 +143,28 @@ suite on pushes and pull requests with a Redis 7 service and Python 3.11 and
 
 ## Run the benchmark
 
+To repeat the branch comparison, run both commands on the same machine with
+Redis running. Each command uses a fresh cache namespace.
+
+```powershell
+.\.venv\Scripts\python -m benchmarks.run --backend fastapi --requests 100 --refresh-comparison --output fastapi.json
+.\.venv\Scripts\python -m benchmarks.run --backend threaded --requests 100 --refresh-comparison --output threaded.json
+```
+
+One Windows loopback run used a 1 KiB response, a 20 ms origin delay, and four
+clients per concurrent burst. Mean client latency in milliseconds was:
+
+| Scenario | FastAPI | Threaded |
+| --- | ---: | ---: |
+| Cold miss | 33.96 | 58.44 |
+| Warm hit | 5.17 | 3.69 |
+| Concurrent cold requests for the same key | 33.68 | 54.64 |
+| Stale response during background refresh | 6.25 | 9.97 |
+
+Both backends made 25 origin calls for 100 concurrent cold requests. See the
+[threaded baseline](https://github.com/atharvsalvi/caching-proxy-server/tree/codex/threaded-baseline)
+for the original implementation.
+
 ```powershell
 .\.venv\Scripts\python -m benchmarks.run --refresh-comparison --output my-run.json
 ```

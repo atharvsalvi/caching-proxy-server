@@ -4,13 +4,13 @@ A Python reverse proxy that forwards HTTP requests to one configured origin and
 shares eligible GET responses through Redis. The response header `X-Cache` lets
 you follow a request through a cold fetch, a cache hit, or a refresh.
 
-This branch, `codex/threaded-baseline`, runs Python's `ThreadingHTTPServer`.
+The threaded baseline on `main` and `threaded-baseline` runs Python's `ThreadingHTTPServer`.
 Each client connection gets a thread. When several clients request the same
 cold cache key, the first thread fetches the response and the others recheck
 Redis after it finishes. The local demo below starts this threaded server.
 
 For the asynchronous implementation and commands to benchmark both backends
-with the same workload, see the [FastAPI branch](https://github.com/atharvsalvi/caching-proxy-server/tree/codex/fastapi#run-the-benchmark).
+with the same workload, see the [FastAPI branch](https://github.com/atharvsalvi/caching-proxy-server/tree/fastapi#run-the-benchmark).
 
 ## Run a local demo
 

@@ -142,19 +142,93 @@ The [GitHub Actions workflow](.github/workflows/tests.yml) runs the strict
 suite on pushes and pull requests with a Redis 7 service and Python 3.11 and
 3.13. [Test coverage and isolation](docs/phase-5-testing.md)
 
-## Run the benchmark
+## Latency report
+
+On the threaded proxy, a warm cache hit averaged **3.52 ms**, compared with
+**32.11 ms** for a direct origin request. A first request for a new URL averaged
+**69.84 ms** through the proxy. In this workload, the latency benefit came from
+reusing a response after the first fetch.
+
+### What was measured
+
+The November 12, 2026 runs used Windows 11, Python 3.13.4, and Redis 7.4.12
+in Docker Desktop. The client, threaded proxy, and HTTP origin ran on the same
+machine. The origin waited 20 ms per request and served a 1 KiB body. Each
+client timer covered opening a new connection through reading the last byte.
+The runner checked the status, body, cache outcomes, and origin request count.
+
+### Fresh and cold entries
+
+Each row contains 200 timed requests. The first three scenarios sent one
+request at a time. The last sent 50 bursts of four clients, each burst asking
+for the same new URL. The warm-hit row excludes the initial cache fill.
+
+| Scenario | Mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Requests/s | Origin calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Direct to origin | 32.11 | 33.25 | 45.40 | 47.58 | 31.12 | 200 |
+| Cold MISS | 69.84 | 68.03 | 85.76 | 100.00 | 14.32 | 200 |
+| Warm HIT | 3.52 | 1.59 | 17.49 | 24.42 | 283.42 | 0 |
+| Four clients, same cold URL | 59.73 | 63.39 | 70.22 | 71.63 | 65.26 | 50 |
+
+A typical warm hit took **1.59 ms** (the median, or p50), and 95% finished
+within **17.49 ms**. A cold miss included Redis lookups, the origin fetch, and
+a cache write. In the four-client bursts, one thread fetched each URL and the
+others reused it. That produced 50 misses and 150 hits. A request recorded as
+a hit could still spend most of its time waiting for the first fetch.
+[Per-request timings and environment](benchmarks/sample-run.json)
+
+### When a cached response expires
+
+A second run primed 50 URLs with an ETag and immediate expiry. Four clients
+then requested each URL together. In blocking mode the first client waited
+for the origin to validate the saved response. In background mode the origin
+allowed the proxy to serve the saved response for up to 10 seconds after
+expiry while it checked for an update.
+
+| Refresh behavior | Mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Origin validations | Client outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Wait for validation | 58.30 | 61.79 | 69.56 | 71.01 | 50 | 50 REVALIDATED, 150 HIT |
+| Serve stale during refresh | 12.18 | 4.30 | 28.84 | 30.53 | 50 | 200 STALE |
+
+Background refresh saved clients **46.12 ms on average** with the same number
+of origin validations. Clients could receive an older body during that window.
+The runner waited for each refresh to finish and verified a fresh hit before
+the next burst. Those checks and the initial cache fills were outside the
+timed requests. [Per-request refresh timings](benchmarks/stale-refresh-run.json)
+
+### Threaded versus FastAPI
+
+A separate Windows comparison used 100 requests per scenario with the same
+body size, origin delay, and burst size. Both columns below are **mean client
+latency in milliseconds** from that comparison.
+
+| Scenario | Threaded | FastAPI |
+| --- | ---: | ---: |
+| Cold MISS | 58.44 | 33.96 |
+| Warm HIT | 3.69 | 5.17 |
+| Four clients, same cold URL | 54.64 | 33.68 |
+| Serve stale during refresh | 9.97 | 6.25 |
+
+The threaded server had the lower mean for warm hits in this run. FastAPI had
+the lower mean for cold requests and background refresh. Both made 25 origin
+calls for 100 clients in the cold bursts. These are local measurements with
+fresh connections and a fixed origin delay. Deployment latency and throughput
+depend on network distance, connection reuse, and the actual mix of requests.
+[Backend comparison and commands](https://github.com/atharvsalvi/caching-proxy-server/tree/fastapi#run-the-benchmark)
+
+### Reproduce the threaded measurements
+
+With Redis running on port 6379, run this from the repository root. The
+runner starts the origin and proxy on temporary ports, uses a dedicated Redis
+prefix, and writes individual request times and summaries to the JSON file.
 
 ```powershell
-.\.venv\Scripts\python -m benchmarks.run --refresh-comparison --output my-run.json
+.\.venv\Scripts\python -m benchmarks.run --requests 200 --workers 4 --delay-ms 20 --refresh-comparison --output my-run.json
 ```
 
-The runner starts the client, proxy and origin locally and uses a dedicated
-Redis prefix. In one Windows run with a 1 KiB response, 20 ms of simulated
-origin work and 200 requests per scenario, mean client latency was **32.11 ms
-direct**, **69.84 ms on a cold MISS**, and **3.52 ms on a warm HIT**. In the
-same run, four-client cold bursts resulted in 50 origin calls for 200 clients.
-Host scheduling, network placement and workload shape affect these numbers.
-[Methodology, percentiles and raw samples](docs/phase-6-benchmark.md)
+Throughput uses completed requests divided by elapsed wall time, so concurrent
+requests can overlap. With 200 samples, p99 is the 198th sorted time and can
+shift between runs. [Benchmark methodology](docs/phase-6-benchmark.md)
 
 ## Scope and limitations
 
